@@ -20,11 +20,9 @@ package org.apache.pulsar.broker.service.nonpersistent;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static org.apache.bookkeeper.mledger.impl.EntryCacheManager.create;
-import static org.apache.bookkeeper.mledger.impl.ManagedLedgerMBeanImpl.ENTRY_LATENCY_BUCKETS_USEC;
 import static org.apache.pulsar.broker.cache.ConfigurationCacheService.POLICIES;
 
 import com.carrotsearch.hppc.ObjectObjectHashMap;
-import com.google.common.base.MoreObjects;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
@@ -39,13 +37,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.apache.bookkeeper.common.util.OrderedExecutor;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.Position;
-import org.apache.bookkeeper.mledger.util.StatsBuckets;
 import org.apache.pulsar.broker.admin.AdminResource;
+import org.apache.pulsar.broker.service.AbstractTopic;
 import org.apache.pulsar.broker.service.BrokerService;
 import org.apache.pulsar.broker.service.BrokerServiceException;
 import org.apache.pulsar.broker.service.BrokerServiceException.ConsumerBusyException;
@@ -65,7 +61,6 @@ import org.apache.pulsar.broker.service.StreamingStats;
 import org.apache.pulsar.broker.service.Subscription;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.schema.SchemaCompatibilityStrategy;
-import org.apache.pulsar.broker.service.schema.SchemaRegistryService;
 import org.apache.pulsar.broker.stats.ClusterReplicationMetrics;
 import org.apache.pulsar.broker.stats.NamespaceStats;
 import org.apache.pulsar.client.api.MessageId;
@@ -83,54 +78,29 @@ import org.apache.pulsar.common.policies.data.PersistentTopicInternalStats.Curso
 import org.apache.pulsar.common.policies.data.Policies;
 import org.apache.pulsar.common.policies.data.PublisherStats;
 import org.apache.pulsar.common.schema.SchemaData;
-import org.apache.pulsar.common.schema.SchemaVersion;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.collections.ConcurrentOpenHashMap;
-import org.apache.pulsar.common.util.collections.ConcurrentOpenHashSet;
 import org.apache.pulsar.policies.data.loadbalancer.NamespaceBundleStats;
 import org.apache.pulsar.utils.StatsOutputStream;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class NonPersistentTopic implements Topic {
-    private final String topic;
-
-    // Producers currently connected to this topic
-    private final ConcurrentOpenHashSet<Producer> producers;
+public class NonPersistentTopic extends AbstractTopic implements Topic {
 
     // Subscriptions to this topic
     private final ConcurrentOpenHashMap<String, NonPersistentSubscription> subscriptions;
 
     private final ConcurrentOpenHashMap<String, NonPersistentReplicator> replicators;
 
-    private final BrokerService brokerService;
-
-    private volatile boolean isFenced;
-
-    // Prefix for replication cursors
-    public final String replicatorPrefix;
-
     protected static final AtomicLongFieldUpdater<NonPersistentTopic> USAGE_COUNT_UPDATER = AtomicLongFieldUpdater
             .newUpdater(NonPersistentTopic.class, "usageCount");
     private volatile long usageCount = 0;
 
-    private final OrderedExecutor executor;
-
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-
-    // Timestamp of when this topic was last seen active
-    private volatile long lastActive;
-
-    // Flag to signal that producer of this topic has published batch-message so, broker should not allow consumer which
-    // doesn't support batch-message
-    private volatile boolean hasBatchMessagePublished = false;
     // Ever increasing counter of entries added
-    static final AtomicLongFieldUpdater<NonPersistentTopic> ENTRIES_ADDED_COUNTER_UPDATER = AtomicLongFieldUpdater
+    private static final AtomicLongFieldUpdater<NonPersistentTopic> ENTRIES_ADDED_COUNTER_UPDATER = AtomicLongFieldUpdater
             .newUpdater(NonPersistentTopic.class, "entriesAddedCounter");
     private volatile long entriesAddedCounter = 0;
-    private static final long POLICY_UPDATE_FAILURE_RETRY_TIME_SECONDS = 60;
-    private StatsBuckets addEntryLatencyStatsUsec = new StatsBuckets(ENTRY_LATENCY_BUCKETS_USEC);
 
     private static final FastThreadLocal<TopicStats> threadLocalTopicStats = new FastThreadLocal<TopicStats>() {
         @Override
@@ -138,13 +108,6 @@ public class NonPersistentTopic implements Topic {
             return new TopicStats();
         }
     };
-
-    // Whether messages published must be encrypted or not in this topic
-    private volatile boolean isEncryptionRequired = false;
-    private volatile SchemaCompatibilityStrategy schemaCompatibilityStrategy =
-        SchemaCompatibilityStrategy.FULL;
-    // schema validation enforced flag
-    private volatile boolean schemaValidationEnforced = false;
 
     private static class TopicStats {
         public double averageMsgSize;
@@ -170,14 +133,10 @@ public class NonPersistentTopic implements Topic {
     }
 
     public NonPersistentTopic(String topic, BrokerService brokerService) {
-        this.topic = topic;
-        this.brokerService = brokerService;
-        this.producers = new ConcurrentOpenHashSet<Producer>(16, 1);
+        super(topic, brokerService);
         this.subscriptions = new ConcurrentOpenHashMap<>(16, 1);
         this.replicators = new ConcurrentOpenHashMap<>(16, 1);
         this.isFenced = false;
-        this.replicatorPrefix = brokerService.pulsar().getConfiguration().getReplicatorPrefix();
-        this.executor = brokerService.getTopicOrderedExecutor();
         USAGE_COUNT_UPDATER.set(this, 0);
 
         this.lastActive = System.nanoTime();
@@ -228,75 +187,18 @@ public class NonPersistentTopic implements Topic {
     }
 
     @Override
-    public void addProducer(Producer producer) throws BrokerServiceException {
-        checkArgument(producer.getTopic() == this);
-
-        lock.readLock().lock();
-        try {
-            brokerService.checkTopicNsOwnership(getName());
-
-            if (isFenced) {
-                log.warn("[{}] Attempting to add producer to a fenced topic", topic);
-                throw new TopicFencedException("Topic is temporarily unavailable");
-            }
-
-            if (isProducersExceeded()) {
-                log.warn("[{}] Attempting to add producer to topic which reached max producers limit", topic);
-                throw new ProducerBusyException("Topic reached max producers limit");
-            }
-
-            if (log.isDebugEnabled()) {
-                log.debug("[{}] {} Got request to create producer ", topic, producer.getProducerName());
-            }
-
-            if (!producers.add(producer)) {
-                throw new NamingException(
-                        "Producer with name '" + producer.getProducerName() + "' is already connected to topic");
-            }
-
-            USAGE_COUNT_UPDATER.incrementAndGet(this);
-            if (log.isDebugEnabled()) {
-                log.debug("[{}] [{}] Added producer -- count: {}", topic, producer.getProducerName(),
-                        USAGE_COUNT_UPDATER.get(this));
-            }
-
-        } finally {
-            lock.readLock().unlock();
-        }
+    protected void incrementUsageCount() {
+        USAGE_COUNT_UPDATER.incrementAndGet(this);
     }
 
-    private boolean isProducersExceeded() {
-        Policies policies;
-        try {
-            policies =  brokerService.pulsar().getConfigurationCache().policiesCache()
-                    .get(AdminResource.path(POLICIES, TopicName.get(topic).getNamespace()))
-                    .orElseGet(() -> new Policies());
-        } catch (Exception e) {
-            policies = new Policies();
-        }
-        final int maxProducers = policies.max_producers_per_topic > 0 ?
-                policies.max_producers_per_topic :
-                brokerService.pulsar().getConfiguration().getMaxProducersPerTopic();
-        if (maxProducers > 0 && maxProducers <= producers.size()) {
-            return true;
-        }
-        return false;
+    @Override
+    protected long getUsageCount() {
+        return USAGE_COUNT_UPDATER.get(this);
     }
 
     @Override
     public void checkMessageDeduplicationInfo() {
         // No-op
-    }
-
-    private boolean hasLocalProducers() {
-        AtomicBoolean foundLocal = new AtomicBoolean(false);
-        producers.forEach(producer -> {
-            if (!producer.isRemote()) {
-                foundLocal.set(true);
-            }
-        });
-
-        return foundLocal.get();
     }
 
     @Override
@@ -673,16 +575,6 @@ public class NonPersistentTopic implements Topic {
         // No-op
     }
 
-    @Override
-    public String toString() {
-        return MoreObjects.toStringHelper(this).add("topic", topic).toString();
-    }
-
-    @Override
-    public ConcurrentOpenHashSet<Producer> getProducers() {
-        return producers;
-    }
-
     public int getNumberOfConsumers() {
         int count = 0;
         for (NonPersistentSubscription subscription : subscriptions.values()) {
@@ -708,15 +600,6 @@ public class NonPersistentTopic implements Topic {
 
     public Replicator getPersistentReplicator(String remoteCluster) {
         return replicators.get(remoteCluster);
-    }
-
-    public BrokerService getBrokerService() {
-        return brokerService;
-    }
-
-    @Override
-    public String getName() {
-        return topic;
     }
 
     public void updateRates(NamespaceStats nsStats, NamespaceBundleStats bundleStats, StatsOutputStream topicStatsStream,
@@ -996,14 +879,6 @@ public class NonPersistentTopic implements Topic {
     }
 
     @Override
-    public boolean isEncryptionRequired() {
-        return isEncryptionRequired;
-    }
-
-    @Override
-    public boolean getSchemaValidationEnforced() { return schemaValidationEnforced; }
-
-    @Override
     public boolean isReplicated() {
         return replicators.size() > 1;
     }
@@ -1019,57 +894,8 @@ public class NonPersistentTopic implements Topic {
         throw new UnsupportedOperationException("getLastMessageId is not supported on non-persistent topic");
     }
 
-    public void markBatchMessagePublished() {
-        this.hasBatchMessagePublished = true;
-    }
-
     private static final Logger log = LoggerFactory.getLogger(NonPersistentTopic.class);
 
-    @Override
-    public CompletableFuture<Boolean> hasSchema() {
-        String base = TopicName.get(getName()).getPartitionedTopicName();
-        String id = TopicName.get(base).getSchemaName();
-        return brokerService.pulsar()
-            .getSchemaRegistryService()
-            .getSchema(id).thenApply((schema) -> schema != null);
-    }
-
-    @Override
-    public CompletableFuture<SchemaVersion> addSchema(SchemaData schema) {
-        if (schema == null) {
-            return CompletableFuture.completedFuture(SchemaVersion.Empty);
-        }
-
-        String base = TopicName.get(getName()).getPartitionedTopicName();
-        String id = TopicName.get(base).getSchemaName();
-        return brokerService.pulsar()
-            .getSchemaRegistryService()
-            .putSchemaIfAbsent(id, schema, schemaCompatibilityStrategy);
-    }
-
-    @Override
-    public CompletableFuture<SchemaVersion> deleteSchema() {
-        String base = TopicName.get(getName()).getPartitionedTopicName();
-        String id = TopicName.get(base).getSchemaName();
-        SchemaRegistryService schemaRegistryService = brokerService.pulsar().getSchemaRegistryService();
-        return schemaRegistryService.getSchema(id)
-                .thenCompose(schema -> {
-                    if (schema != null) {
-                        return schemaRegistryService.deleteSchema(id, "");
-                    } else {
-                        return CompletableFuture.completedFuture(null);
-                    }
-                });
-    }
-
-    @Override
-    public CompletableFuture<Boolean> isSchemaCompatible(SchemaData schema) {
-        String base = TopicName.get(getName()).getPartitionedTopicName();
-        String id = TopicName.get(base).getSchemaName();
-        return brokerService.pulsar()
-            .getSchemaRegistryService()
-            .isCompatible(id, schema, schemaCompatibilityStrategy);
-    }
 
     @Override
     public CompletableFuture<Boolean> addSchemaIfIdleOrCheckCompatible(SchemaData schema) {
@@ -1081,10 +907,5 @@ public class NonPersistentTopic implements Topic {
                         return addSchema(schema).thenApply((ignore) -> true);
                     }
                 });
-    }
-    
-    @Override
-    public void recordAddLatency(long latencyUSec) {
-        addEntryLatencyStatsUsec.addValue(latencyUSec);
     }
 }
